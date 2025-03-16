@@ -1,25 +1,362 @@
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Redirigiendo...</title>
-    <script>
-        const params = new URLSearchParams(window.location.search);
-        const redirectUrl = params.get("redirect");
+// CampaignScheduler.tsx
+import React, { useState, useEffect } from 'react';
+import { toast } from '@/hooks/use-toast';
+import { useUser } from './UserContext'; // Importa el hook de usuario
 
-        if (redirectUrl) {
-            setTimeout(() => {
-                window.location.href = redirectUrl;
-            }, 1000);
+// ===== TIPOS Y CONFIGURACIÓN =====
+
+export type FrequencyOption = {
+  id: string;
+  label: string;
+  description: string;
+  messagesPerMinute: number;
+};
+
+export const frequencyOptions: FrequencyOption[] = [
+  {
+    id: 'option1',
+    label: 'Estándar: 1 mensaje por minuto',
+    description: 'Envía 1 mensaje cada minuto',
+    messagesPerMinute: 1
+  },
+  {
+    id: 'option2',
+    label: 'Agrupado: 3 mensajes cada 2 minutos',
+    description: 'Envía 3 mensajes consecutivos y espera 2 minutos',
+    messagesPerMinute: 1.5
+  }
+];
+
+export type ActiveSchedule = {
+  daysOfWeek: number[]; // 0: Domingo, 1: Lunes, …, 6: Sábado
+  startHour: number;    // Hora de inicio (ej. 6 para las 06:00)
+  endHour: number;      // Hora de fin (ej. 23 para las 23:00)
+};
+
+export type Campaign = {
+  id: string;
+  userId: string;
+  name: string;
+  createdAt: Date;
+  scheduledDate: Date;
+  activeSchedule: ActiveSchedule;
+  frequencyOption: FrequencyOption;
+  status: 'Scheduled' | 'InProgress' | 'Completed' | 'Canceled';
+  contacts: { name: string; phone: string }[];
+  message: string;
+  messageType: 'text' | 'media';
+  attachments?: { url: string; type: 'img' | 'video' | 'doc' }[];
+  logs?: string[];
+};
+
+// ===== DUMMY DE LOS SERVICIOS DE WHATSAPP =====
+
+export const wapiService = {
+  sendTextMessage: async (
+    credentials: { device: string; token: string },
+    recipient: { phone: string; name: string },
+    message: string
+  ): Promise<boolean> => {
+    console.log("Enviando mensaje de texto a", recipient, message);
+    return new Promise(resolve => setTimeout(() => resolve(true), 500));
+  },
+  sendMediaMessage: async (
+    credentials: { device: string; token: string },
+    recipient: { phone: string; name: string },
+    messageCaption: string,
+    media: { url: string; type: 'img' | 'video' | 'doc' }
+  ): Promise<boolean> => {
+    console.log("Enviando mensaje de media a", recipient, messageCaption, media);
+    return new Promise(resolve => setTimeout(() => resolve(true), 500));
+  }
+};
+
+const dummyCredentials = { device: "dummyDevice", token: "dummyToken" };
+
+// ===== UTILIDADES PARA CAMPAÑAS =====
+
+// Verifica si la hora actual está dentro de la ventana activa configurada
+const isWithinActiveSchedule = (activeSchedule: ActiveSchedule): boolean => {
+  const now = new Date();
+  const day = now.getDay();
+  const hour = now.getHours();
+  if (!activeSchedule.daysOfWeek.includes(day)) return false;
+  if (hour < activeSchedule.startHour || hour >= activeSchedule.endHour) return false;
+  return true;
+};
+
+// Obtiene las campañas almacenadas en localStorage filtradas por usuario
+const getCampaigns = (userId: string): Campaign[] => {
+  const data = localStorage.getItem("campaigns");
+  const allCampaigns: Campaign[] = data ? JSON.parse(data) : [];
+  return allCampaigns.filter(c => c.userId === userId);
+};
+
+// Guarda o actualiza una campaña en localStorage (para el usuario actual)
+const saveCampaign = (campaign: Campaign) => {
+  let campaigns: Campaign[] = JSON.parse(localStorage.getItem("campaigns") || "[]");
+  const index = campaigns.findIndex(c => c.id === campaign.id);
+  if (index > -1) {
+    campaigns[index] = campaign;
+  } else {
+    campaigns.push(campaign);
+  }
+  localStorage.setItem("campaigns", JSON.stringify(campaigns));
+};
+
+// ===== LÓGICA DE ENVÍO =====
+
+// Procesa el envío de una campaña: actualiza estado, recorre contactos y llama al servicio adecuado
+const processSendCampaign = async (campaign: Campaign): Promise<void> => {
+  campaign.status = 'InProgress';
+  campaign.logs = campaign.logs || [];
+  campaign.logs.push(`Campaña iniciada a ${new Date().toISOString()}`);
+
+  for (let i = 0; i < campaign.contacts.length; i++) {
+    const contact = campaign.contacts[i];
+    let success = false;
+    const personalizedMessage = campaign.message.replace("{nombre}", contact.name);
+    
+    if (campaign.messageType === 'text') {
+      success = await wapiService.sendTextMessage(dummyCredentials, contact, personalizedMessage);
+    } else if (campaign.messageType === 'media' && campaign.attachments && campaign.attachments.length > 0) {
+      success = await wapiService.sendMediaMessage(dummyCredentials, contact, personalizedMessage, campaign.attachments[0]);
+    }
+
+    if (success) {
+      campaign.logs.push(`Mensaje enviado a ${contact.phone}`);
+    } else {
+      campaign.logs.push(`Fallo al enviar a ${contact.phone}`);
+    }
+    
+    // Espera según la frecuencia configurada
+    const delay = 60000 / campaign.frequencyOption.messagesPerMinute;
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  
+  campaign.status = 'Completed';
+  campaign.logs.push(`Campaña completada a ${new Date().toISOString()}`);
+  saveCampaign(campaign);
+  toast({ title: "Campaña completada", description: "La campaña se envió correctamente.", variant: "default" });
+};
+
+// Hook que revisa periódicamente las campañas programadas y dispara el envío
+const useCampaignScheduler = (userId: string) => {
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const campaigns = getCampaigns(userId);
+      const now = new Date();
+      campaigns.forEach(campaign => {
+        if (
+          campaign.status === 'Scheduled' &&
+          new Date(campaign.scheduledDate) <= now &&
+          isWithinActiveSchedule(campaign.activeSchedule)
+        ) {
+          processSendCampaign(campaign);
         }
-    </script>
-</head>
-<body>
-    <p>Redirigiendo a WhatsApp...</p>
-    <p>Si no sucede automáticamente, <a id="manualLink" href="#">haz clic aquí</a>.</p>
-    <script>
-        document.getElementById("manualLink").href = redirectUrl;
-    </script>
-</body>
-</html>
+      });
+    }, 60000); // Revisa cada minuto
+    return () => clearInterval(interval);
+  }, [userId]);
+};
+
+// ===== COMPONENTE PRINCIPAL =====
+
+const CampaignScheduler: React.FC = () => {
+  const { user } = useUser(); // Obtener usuario autenticado
+  // Si no hay usuario, mostrar un mensaje o redirigir al login
+  if (!user) return <div>Por favor, inicie sesión.</div>;
+
+  // Inicia el scheduler para el usuario actual
+  useCampaignScheduler(user.id);
+
+  // Estados del formulario de creación de campaña
+  const [name, setName] = useState("");
+  const [scheduledDate, setScheduledDate] = useState("");
+  const [scheduledTime, setScheduledTime] = useState("00:00");
+  const [activeDays, setActiveDays] = useState<number[]>([1, 2, 3, 4, 5]); // Lunes a Viernes por defecto
+  const [startHour, setStartHour] = useState(6);
+  const [endHour, setEndHour] = useState(23);
+  const [frequencyId, setFrequencyId] = useState("option1");
+  const [message, setMessage] = useState("");
+  const [messageType, setMessageType] = useState<"text" | "media">("text");
+  const [contacts, setContacts] = useState<{ name: string; phone: string }[]>([]);
+  const [attachmentUrl, setAttachmentUrl] = useState("");
+
+  // Maneja la creación de una nueva campaña
+  const handleCreateCampaign = () => {
+    if (!scheduledDate) {
+      alert("Seleccione una fecha para la campaña.");
+      return;
+    }
+    // Combina la fecha y hora programada
+    const [hours, minutes] = scheduledTime.split(":").map(Number);
+    const dateObj = new Date(scheduledDate);
+    dateObj.setHours(hours);
+    dateObj.setMinutes(minutes);
+
+    const newCampaign: Campaign = {
+      id: Math.random().toString(36).substr(2, 9),
+      userId: user.id, // Se asocia la campaña al usuario actual
+      name,
+      createdAt: new Date(),
+      scheduledDate: dateObj,
+      activeSchedule: {
+        daysOfWeek: activeDays,
+        startHour,
+        endHour
+      },
+      frequencyOption: frequencyOptions.find(f => f.id === frequencyId)!,
+      status: "Scheduled",
+      contacts,
+      message,
+      messageType,
+      attachments: messageType === "media" && attachmentUrl ? [{ url: attachmentUrl, type: "img" }] : []
+    };
+
+    saveCampaign(newCampaign);
+    toast({
+      title: "Campaña programada",
+      description: "La campaña se ha guardado y se enviará en la fecha programada.",
+      variant: "default"
+    });
+  };
+
+  return (
+    <div className="p-4">
+      <h1 className="text-2xl font-bold">Programar Campaña de WhatsApp</h1>
+      <div className="space-y-4">
+        <input
+          className="input"
+          placeholder="Nombre de la campaña"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+        <input
+          className="input"
+          type="date"
+          value={scheduledDate}
+          onChange={(e) => setScheduledDate(e.target.value)}
+        />
+        <input
+          className="input"
+          type="time"
+          value={scheduledTime}
+          onChange={(e) => setScheduledTime(e.target.value)}
+        />
+
+        <div>
+          <label>Días activos (0=Dom, 1=Lun, ... 6=Sáb): </label>
+          <input
+            className="input"
+            type="text"
+            placeholder="Ej: 1,2,3,4,5"
+            onChange={(e) => {
+              const days = e.target.value.split(",").map(Number);
+              setActiveDays(days);
+            }}
+          />
+        </div>
+
+        <div className="flex gap-2">
+          <div>
+            <label>Hora de inicio</label>
+            <input
+              className="input"
+              type="number"
+              value={startHour}
+              onChange={(e) => setStartHour(parseInt(e.target.value, 10))}
+            />
+          </div>
+          <div>
+            <label>Hora de fin</label>
+            <input
+              className="input"
+              type="number"
+              value={endHour}
+              onChange={(e) => setEndHour(parseInt(e.target.value, 10))}
+            />
+          </div>
+        </div>
+
+        <div>
+          <label>Frecuencia de envío</label>
+          <select
+            className="input"
+            value={frequencyId}
+            onChange={(e) => setFrequencyId(e.target.value)}
+          >
+            {frequencyOptions.map(opt => (
+              <option key={opt.id} value={opt.id}>{opt.label}</option>
+            ))}
+          </select>
+        </div>
+
+        <textarea
+          className="input"
+          placeholder="Mensaje a enviar (usa {nombre} para personalizar)"
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+        />
+
+        <div>
+          <label>Tipo de mensaje:</label>
+          <select
+            className="input"
+            value={messageType}
+            onChange={(e) => setMessageType(e.target.value as "text" | "media")}
+          >
+            <option value="text">Texto</option>
+            <option value="media">Media</option>
+          </select>
+        </div>
+
+        {messageType === "media" && (
+          <input
+            className="input"
+            placeholder="URL del attachment"
+            value={attachmentUrl}
+            onChange={(e) => setAttachmentUrl(e.target.value)}
+          />
+        )}
+
+        {/* Aquí se pueden incluir campos para cargar contactos */}
+        <button onClick={handleCreateCampaign} className="btn btn-primary">
+          Programar Campaña
+        </button>
+      </div>
+
+      <h2 className="text-xl font-semibold mt-8">Campañas Programadas</h2>
+      <div>
+        {getCampaigns(user.id)
+          .filter(c => c.status === "Scheduled")
+          .map(campaign => (
+            <div key={campaign.id} className="border p-2 my-2">
+              <h3>{campaign.name}</h3>
+              <p>Programada para: {new Date(campaign.scheduledDate).toLocaleString()}</p>
+              <p>
+                Ventana activa: Días {campaign.activeSchedule.daysOfWeek.join(", ")} de{" "}
+                {campaign.activeSchedule.startHour}:00 a {campaign.activeSchedule.endHour}:00
+              </p>
+            </div>
+          ))}
+      </div>
+
+      <h2 className="text-xl font-semibold mt-8">Historial de Campañas</h2>
+      <div>
+        {getCampaigns(user.id).map(campaign => (
+          <div key={campaign.id} className="border p-2 my-2">
+            <h3>
+              {campaign.name} - {campaign.status}
+            </h3>
+            <p>Creada: {new Date(campaign.createdAt).toLocaleString()}</p>
+            <p>Programada para: {new Date(campaign.scheduledDate).toLocaleString()}</p>
+            <p>Logs: {campaign.logs?.join(" | ")}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+export default CampaignScheduler;
